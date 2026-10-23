@@ -67,6 +67,14 @@ Urgent: please change account access immediately.
 
 Rerun the script and note `status=awaiting_approval`. The dispatcher cannot process this request until the operator explicitly approves it. A rejection is terminal. Every decision leaves an audit record, accessible to the authenticated operator.
 
+Non-urgent requests such as `Please disable this user's login` also require approval,
+even when the classifier returns normal urgency and high confidence. The deterministic
+gate reviews account/authentication and permission language, plus user/group lifecycle
+changes. It normalizes case and separators such as `sign-in` and `LOG_IN`. Security
+information requests are conservatively reviewed too; ordinary pricing, user-guide,
+and notification requests can still use the low-risk route. See the policy's
+[scope and limitations](docs/SECURITY.md#account-and-permission-review).
+
 ### Optional real AI adapter
 
 Set `AI_BACKEND=openai` and configure `OPENAI_API_KEY` and `OPENAI_MODEL` with a model supporting strict JSON schema outputs. This enables the real LLM classifier; the default mode does **not** call OpenAI or any remote service. The adapter uses basic email/phone redaction before sending text, but this is insufficient for actual customer PII. **Use synthetic inputs only.** API calls may incur usage charges. If the provider fails, the request is placed in manual review.

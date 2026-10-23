@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from workflow_demo.api import Settings, create_app
+from workflow_demo.classifiers import RulesClassifier
 from workflow_demo.models import Classification
 from workflow_demo.store import MockCRM, WorkflowStore
 
@@ -30,6 +31,14 @@ class FailClassifier:
 class LowConfidenceClassifier:
     def classify(self, message):
         return Classification(department="operations", urgency="normal", confidence=0.2)
+
+
+class StaticClassifier:
+    def __init__(self, result):
+        self.result = result
+
+    def classify(self, message):
+        return self.result
 
 
 @pytest.fixture
@@ -138,6 +147,131 @@ def test_approval_flow_and_operator_auth(setup):
     assert client.post(f"/v1/workflows/{wid}/approve", headers=authorized()).json()["status"] == "queued"
     assert client.post(f"/v1/workflows/{wid}/approve", headers=authorized()).status_code == 409
     assert client.post("/v1/outbox/drain", headers=authorized()).json()["succeeded"] == 1
+
+
+@pytest.mark.parametrize("message", [
+    "Please disable this user's login",
+    "Please re-enable this user's sign-in.",
+    "Reset Casey's password.",
+    "Grant Taylor administrator privileges.",
+    "Remove this user's permissions.",
+    "Add Casey to the finance group.",
+    "Suspend this user.",
+    "Rotate the API key.",
+])
+@pytest.mark.parametrize("classifier_kind", ["rules", "confident_stub"])
+def test_account_changes_cannot_dispatch_before_operator_approval(tmp_path, message, classifier_kind):
+    clock = FakeClock()
+    settings = Settings(WEBHOOK_SECRET, OPERATOR_TOKEN, str(tmp_path / "account.sqlite3"))
+    store = WorkflowStore(settings.db_path, clock=clock)
+    dispatcher = MockCRM()
+    classifier = RulesClassifier() if classifier_kind == "rules" else StaticClassifier(
+        Classification(department="sales", urgency="normal", confidence=1.0)
+    )
+    app = create_app(settings, store=store, classifier=classifier, dispatcher=dispatcher, clock=clock)
+    with TestClient(app) as client:
+        response = signed(client, lead(message))
+        assert response.status_code == 200
+        result = response.json()
+        wid = result["workflow_id"]
+        assert result["status"] == "awaiting_approval"
+        assert result["requires_approval"] is True
+        assert result["urgency"] == "normal"
+        record = store.get(wid)
+        assert record["confidence"] == (0.86 if classifier_kind == "rules" else 1.0)
+        assert record["review_reason"] == "high_impact_request"
+
+        # Neither replay nor an unauthorized approval may create dispatchable work.
+        replay = signed(client, lead(message)).json()
+        assert replay["workflow_id"] == wid and replay["replayed"] is True
+        assert replay["status"] == "awaiting_approval"
+        assert replay["requires_approval"] is True
+        assert client.post(f"/v1/workflows/{wid}/approve").status_code == 401
+        for _ in range(2):
+            drained = client.post("/v1/outbox/drain", headers=authorized())
+            assert drained.status_code == 200
+            assert drained.json()["processed"] == 0
+        with store.connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+        assert dispatcher.sent == []
+        assert [e["action"] for e in store.events(wid)] == ["intake_accepted", "route_selected"]
+        assert store.events(wid)[1]["detail"] == "high_impact_request"
+
+        approval = client.post(f"/v1/workflows/{wid}/approve", headers=authorized())
+        assert approval.status_code == 200 and approval.json()["status"] == "queued"
+        drained = client.post("/v1/outbox/drain", headers=authorized())
+        assert drained.status_code == 200 and drained.json()["succeeded"] == 1
+        assert dispatcher.sent == [wid]
+        assert store.get(wid)["status"] == "dispatched_mock"
+        assert [e["action"] for e in store.events(wid)] == [
+            "intake_accepted", "route_selected", "approved", "dispatch_attempt", "dispatched_mock",
+        ]
+
+
+def test_rejecting_normal_urgency_login_change_is_terminal(setup):
+    client, store, dispatcher, *_ = setup
+    response = signed(client, lead("Please disable this user's login"))
+    assert response.status_code == 200 and response.json()["status"] == "awaiting_approval"
+    wid = response.json()["workflow_id"]
+    rejected = client.post(f"/v1/workflows/{wid}/reject", headers=authorized())
+    assert rejected.status_code == 200 and rejected.json()["status"] == "rejected"
+    assert client.post(f"/v1/workflows/{wid}/approve", headers=authorized()).status_code == 409
+    assert client.post("/v1/outbox/drain", headers=authorized()).json()["processed"] == 0
+    assert dispatcher.sent == []
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+    assert [e["action"] for e in store.events(wid)] == ["intake_accepted", "route_selected", "rejected"]
+
+
+@pytest.mark.parametrize("message", [
+    "Please send the user guide.",
+    "Please disable email notifications.",
+    "Enable dark mode for the demo.",
+    "Add a chart to the pricing brochure.",
+    "Please provide accounting software pricing.",
+    "We are cataloging product descriptions.",
+])
+def test_safe_requests_still_queue_and_dispatch(setup, message):
+    client, store, dispatcher, *_ = setup
+    response = signed(client, lead(message))
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "queued" and result["requires_approval"] is False
+    assert store.get(result["workflow_id"])["review_reason"] == "low_risk_route"
+    drained = client.post("/v1/outbox/drain", headers=authorized())
+    assert drained.status_code == 200 and drained.json()["succeeded"] == 1
+    assert dispatcher.sent == [result["workflow_id"]]
+
+
+@pytest.mark.parametrize("classifier", [
+    FailClassifier(),
+    StaticClassifier(None),
+    StaticClassifier({"department": "sales", "urgency": "normal", "confidence": 1.1}),
+    StaticClassifier({"department": "sales", "urgency": "normal", "confidence": 1.0, "approved": True}),
+], ids=["timeout", "missing_result", "invalid_confidence", "extra_authority_field"])
+@pytest.mark.parametrize("message", [
+    "Please provide pricing for a demo.",
+    "Please disable this user's login",
+])
+def test_classifier_errors_never_reach_dispatch(tmp_path, classifier, message):
+    clock = FakeClock()
+    settings = Settings(WEBHOOK_SECRET, OPERATOR_TOKEN, str(tmp_path / "invalid.sqlite3"))
+    store = WorkflowStore(settings.db_path, clock=clock)
+    dispatcher = MockCRM()
+    app = create_app(settings, store=store, classifier=classifier, dispatcher=dispatcher, clock=clock)
+    with TestClient(app) as client:
+        response = signed(client, lead(message))
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "awaiting_approval" and result["requires_approval"] is True
+        record = store.get(result["workflow_id"])
+        assert record["classifier"] == "fallback" and record["confidence"] == 0.0
+        assert record["review_reason"] == "classifier_unavailable"
+        assert store.events(result["workflow_id"])[1]["detail"] == "classifier_unavailable"
+        assert client.post("/v1/outbox/drain", headers=authorized()).json()["processed"] == 0
+        with store.connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+        assert dispatcher.sent == []
 
 
 def test_classifier_failure_fails_closed(tmp_path):
